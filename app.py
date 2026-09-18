@@ -259,6 +259,13 @@ NUMBER_RE = re.compile(r"^\d+(?:[.,]\d+)?$")
 DATE_RE = re.compile(
     r"^(?:\d{1,2}[/.\-])?\d{1,2}[/.\-]\d{4}$|^\d{4}[/.\-]\d{1,2}(?:[/.\-]\d{1,2})?$"
 )
+# A real product row starts with: row number + product code, e.g. "35 F15522602 ..."
+ROW_RE = re.compile(r"^(\d+)\s+([A-Za-z]{1,3}\d{4,})\s+(.*)$")
+# Lines that start a page header (the table header repeats on every page and turns
+# the table back on)
+PAGE_HEADER_STARTS = ("picklist", "printed by", "warehouse:")
+# Column-unit / currency header rows such as "(LKR)" and "CA/KG EA/GM CA/KG EA/GM"
+UNIT_HEADER_RE = re.compile(r"ca/kg|ea/gm|\(lkr\)")
 BOILERPLATE_RE = re.compile(
     r"\b(?:product code|product description|select product|filter|mrp|conv|"
     r"selling qty|sampling qty|total qty|batch|expiry date|page|date|"
@@ -314,7 +321,8 @@ def find_sinhala_name(cleaned_line):
 def is_boilerplate(line):
     if not line.strip() or len(line.strip()) < 3:
         return True
-    return bool(BOILERPLATE_RE.search(line.lower()))
+    lower_line = line.lower()
+    return bool(UNIT_HEADER_RE.search(lower_line) or BOILERPLATE_RE.search(lower_line))
 
 
 # --------------------------------------------------------------------------
@@ -339,18 +347,17 @@ def extract_quantities(line):
 
 
 def extract_no_and_description(raw_line):
-    """Extract [No, Description] from a line that has no mapping entry.
-    The description keeps its size (e.g. "MARIE 100GM") so you can tell
-    exactly which product needs to be added to PRODUCT_MAPPING."""
-    tokens = raw_line.strip().split()
-    if not tokens:
+    """Extract (No, Description) from a product row that has no mapping entry.
+    "35 F15522602 FALUDA WAFER 90GM 108.00 24 0 6 0 0 0 6 CG1 01/08/2028"
+        -> ("35", "FALUDA WAFER 90GM")
+    Returns ("", "") if the line is not a product row."""
+    match = ROW_RE.match(raw_line.strip())
+    if not match:
         return "", ""
+    item_no, _code, rest = match.groups()
 
-    item_no = ""
-    if any(ch.isdigit() for ch in tokens[0]):
-        item_no = tokens.pop(0)
-
-    # Strip the trailing numbers / batch code / expiry date
+    # Strip the trailing MRP / quantities / batch code / expiry date
+    tokens = rest.split()
     while tokens and (
         NUMBER_RE.match(tokens[-1])
         or DATE_RE.match(tokens[-1])
@@ -377,7 +384,9 @@ def parse_picklist(pdf_bytes):
                 normalized_line = line.replace('"', "").strip()
                 lower_line = normalized_line.lower()
 
-                if any(k in lower_line for k in ("invoice", "customer name", "sales route")):
+                if lower_line.startswith(PAGE_HEADER_STARTS) or any(
+                    k in lower_line for k in ("invoice", "customer name", "sales route")
+                ):
                     in_target_table = False
                     continue
 
@@ -393,8 +402,10 @@ def parse_picklist(pdf_bytes):
                     qty1, qty2 = extract_quantities(normalized_line)
                     rows.append({COL_ITEM: sinhala_val, COL_CASES: qty1, COL_PIECES: qty2})
                 else:
+                    # Only real product rows count as "missing"; anything else
+                    # (page headers, unit rows, totals) is ignored.
                     item_no, description = extract_no_and_description(normalized_line)
-                    if len(description) > 2:
+                    if description:
                         unmatched.append((item_no, description))
 
     return rows, unmatched
