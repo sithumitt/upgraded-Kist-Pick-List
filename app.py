@@ -239,7 +239,6 @@ def clean_text_for_matching(text):
     return " ".join(cleaned.lower().split())
 
 def is_boilerplate(line):
-    """Filter out table headers or generic UI tags."""
     lower_line = line.lower()
     boilerplate_keywords = [
         "product code", "product description", "select product", 
@@ -269,13 +268,11 @@ if uploaded_file is not None:
         table = doc.add_table(rows=1, cols=3)
         table.style = 'Table Grid'
         
-        # Set column widths (giving more space to columns 1 and 2: Case & Qty)
         col_widths = (Inches(2.5), Inches(2.0), Inches(2.0))
         for row in table.rows:
             for idx, width in enumerate(col_widths):
                 row.cells[idx].width = width
         
-        # Format Header Row with Font Size 16
         hdr_cells = table.rows[0].cells
         hdr_cells[0].text = 'භාණ්ඩය'
         hdr_cells[1].text = 'කේස්'
@@ -291,11 +288,10 @@ if uploaded_file is not None:
         total_product_lines = 0
         preview_data = []
         processed_lines = set()
-        unmatched_lines = []  # To track actual valid product lines that failed to match
+        unmatched_lines = []  
         
-        in_target_table = False  # Flag to track whether we are inside the target item table
+        in_target_table = False  
         
-        # Parse PDF Document content
         with pdfplumber.open(uploaded_file) as pdf:
             for page_num, page in enumerate(pdf.pages):
                 text_content = page.extract_text()
@@ -307,21 +303,17 @@ if uploaded_file is not None:
                     normalized_line = line.replace('"', '').strip()
                     lower_line = normalized_line.lower()
                     
-                    # Section switcher logic: Ignore Invoice/Customer block
                     if "invoice" in lower_line or "customer name" in lower_line or "sales route" in lower_line:
                         in_target_table = False
                         continue
                     
-                    # Section switcher logic: Enter the Target Item Table block
                     if "product description" in lower_line or "selling qty" in lower_line or "total qty" in lower_line:
                         in_target_table = True
                         continue
                     
-                    # Skip parsing if we are not inside the correct item table section
                     if not in_target_table:
                         continue
                     
-                    # Ignore table header rows or column descriptions
                     if is_boilerplate(normalized_line):
                         continue
                         
@@ -364,7 +356,6 @@ if uploaded_file is not None:
                             row_cells[1].text = qty1
                             row_cells[2].text = qty2
                             
-                            # Apply Font Size 16 to the added row cells
                             for cell in row_cells:
                                 for paragraph in cell.paragraphs:
                                     for run in paragraph.runs:
@@ -374,17 +365,15 @@ if uploaded_file is not None:
                             matched_count += 1
                             break 
                     
-                    # If it's a product line inside the target table but didn't match the dictionary
                     if not line_matched:
                         unmatched_lines.append(normalized_line)
 
     missing_count = len(unmatched_lines)
 
-    # Append unmatched product names point-wise at the bottom of the Word document in Font 16
     if unmatched_lines:
-        doc.add_paragraph() # Spacing
+        doc.add_paragraph() 
         heading_para = doc.add_paragraph()
-        run_h = heading_para.add_run("හඳුනා නොගත් / මගහැරුණු අයිතම (Unmatched Items):")
+        run_h = heading_para.add_run("Unmatched Items:")
         run_h.font.size = Pt(16)
         run_h.font.bold = True
         
@@ -396,18 +385,15 @@ if uploaded_file is not None:
     if matched_count > 0:
         st.success(f"🎉 සාර්ථකයි! ගැළපෙන භාණ්ඩ පේළි {matched_count} ක් සාර්ථකව පරිවර්තනය කරන ලදී.")
         
-        # Display comparison metrics
         st.info(f"📊 **සංසන්දන වාර්තාව (Comparison Summary):**\n"
                 f"- නිශ්චිත වගුවේ තිබූ මුළු භාණ්ඩ පේළි ගණන: **{total_product_lines}**\n"
                 f"- සාර්ථකව ගැළපුණු භාණ්ඩ සංඛ්‍යාව: **{matched_count}**\n"
                 f"- මගහැරුණු / නාමාවලියේ නැති අයිතම සංඛ්‍යාව: **{missing_count}**")
         
-        # Render Table Preview Natively
         st.subheader("දත්ත පෙරදසුන (Data Preview)")
         df_preview = pd.DataFrame(preview_data)
         st.dataframe(df_preview, use_container_width=True)
         
-        # Prepare Document download stream bytes
         doc_stream = io.BytesIO()
         doc.save(doc_stream)
         doc_stream.seek(0)
