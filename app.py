@@ -3,9 +3,11 @@
 Run with:  streamlit run picklist_converter.py
 Needs:     pip install streamlit pdfplumber python-docx pandas
 """
+import hashlib
 import inspect
 import io
 import re
+from pathlib import Path
 
 import pandas as pd
 import pdfplumber
@@ -490,8 +492,14 @@ def build_docx(rows, unmatched):
 # --------------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------------
+# Changes whenever this file changes, so a cached result from an older version of
+# the code can never be shown again (st.cache_data only tracks the function's own
+# source, not the helpers it calls). Must NOT start with "_" or it is ignored.
+CODE_VERSION = hashlib.md5(Path(__file__).read_bytes()).hexdigest()
+
+
 @st.cache_data(show_spinner=False)
-def process_pdf(pdf_bytes):
+def process_pdf(pdf_bytes, code_version):
     """Cached, so clicking the download button doesn't re-parse the PDF."""
     rows, unmatched = parse_picklist(pdf_bytes)
     docx_bytes = build_docx(rows, unmatched) if rows else None
@@ -522,7 +530,7 @@ def main():
         return
 
     with st.spinner("දත්ත විශ්ලේෂණය කරමින් පවතී..."):
-        rows, unmatched, docx_bytes = process_pdf(uploaded_file.getvalue())
+        rows, unmatched, docx_bytes = process_pdf(uploaded_file.getvalue(), CODE_VERSION)
 
     matched_count = len(rows)
     missing_count = len(unmatched)
