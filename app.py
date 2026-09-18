@@ -51,6 +51,7 @@ PRODUCT_MAPPING = {
     "creamy vanilla 360gm": "ක්‍රීම් වැනිලා 360",
     "falooda wafer 200gm": "ෆාලූඩා වේපස් 200",
     "faluda wafer 90gm": "ෆාලූඩා වේපස් 90",
+    "faluda wafer 200gm": "ෆාලූඩා වේපස් 200",
     "ginger 80gm": "ඉඟුරු බිස්කට් 80",
     "ginger 250gm": "ඉඟුරු බිස්කට් 250",
     "green apple sparkling 250ml": "ඇපල් ස්පාක්ලින්",
