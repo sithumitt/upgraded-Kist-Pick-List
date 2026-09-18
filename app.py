@@ -15,7 +15,7 @@ import streamlit as st
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt
+from docx.shared import Pt, Twips
 
 FONT_SIZE = Pt(16)
 
@@ -373,9 +373,15 @@ def extract_no_and_description(raw_line):
 
 
 def parse_picklist(pdf_bytes):
-    """Read the PDF and return (rows, unmatched)."""
+    """Read the PDF and return (rows, unmatched, pdf_items).
+
+    rows       - converted items: {Sinhala name, cases, pieces}
+    unmatched  - product rows with no entry in PRODUCT_MAPPING: (no, description)
+    pdf_items  - total number of product rows found in the PDF's item table
+    """
     rows = []
-    unmatched = []  # (no, description)
+    unmatched = []
+    pdf_items = 0
     in_target_table = False
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -398,26 +404,36 @@ def parse_picklist(pdf_bytes):
                     in_target_table = True
                     continue
 
-                if not in_target_table or is_boilerplate(normalized_line):
+                # A real product row ("35 F15522602 FALUDA WAFER 90GM ...") is never
+                # skipped as boilerplate, so it is always counted.
+                looks_like_row = bool(ROW_RE.match(normalized_line))
+                if not in_target_table or (not looks_like_row and is_boilerplate(normalized_line)):
                     continue
 
                 sinhala_val = find_sinhala_name(clean_text_for_matching(normalized_line))
                 if sinhala_val:
+                    pdf_items += 1
                     qty1, qty2 = extract_quantities(normalized_line)
                     rows.append({COL_ITEM: sinhala_val, COL_CASES: qty1, COL_PIECES: qty2})
-                else:
-                    # Only real product rows count as "missing"; anything else
-                    # (page headers, unit rows, totals) is ignored.
+                elif looks_like_row:
+                    # Only real product rows count as "missing"; page headers, unit
+                    # rows and totals are ignored.
+                    pdf_items += 1
                     item_no, description = extract_no_and_description(normalized_line)
-                    if description:
-                        unmatched.append((item_no, description))
+                    unmatched.append((item_no, description or normalized_line.upper()))
 
-    return rows, unmatched
+    return rows, unmatched, pdf_items
 
 
 # --------------------------------------------------------------------------
 # Word document
 # --------------------------------------------------------------------------
+# Column widths in twips (1 inch = 1440), copied from the reference Word file:
+#   item 4878 | cases 2160 | pieces 2322   (table width 9360)
+MAIN_TABLE_WIDTHS = (Twips(4878), Twips(2160), Twips(2322))
+MISSING_TABLE_WIDTHS = (Twips(1440), Twips(7920))  # same total width, 9360
+
+
 def format_run(run, bold=False):
     """Set 16pt (and bold). Sinhala is a complex script, so Word reads the
     complex-script properties (szCs / bCs), not just sz / b. Set both."""
@@ -441,13 +457,18 @@ def write_cell(cell, text, bold=False):
 
 
 def set_column_widths(table, widths):
-    """Apply widths to the grid AND every cell (call after all rows exist;
-    rows added later don't inherit per-cell widths)."""
-    table.autofit = False
+    """Fixed layout with exact widths on the grid, on every cell and on the table
+    itself - the same structure as the reference Word file. Call after all rows
+    exist (rows added later don't inherit per-cell widths)."""
+    table.autofit = False  # <w:tblLayout w:type="fixed"/>
     for idx, width in enumerate(widths):
         table.columns[idx].width = width
         for cell in table.columns[idx].cells:
             cell.width = width
+    tbl_w = table._tbl.tblPr.find(qn("w:tblW"))
+    if tbl_w is not None:
+        tbl_w.set(qn("w:type"), "dxa")
+        tbl_w.set(qn("w:w"), str(sum(w.twips for w in widths)))
 
 
 def build_docx(rows, unmatched):
@@ -465,7 +486,7 @@ def build_docx(rows, unmatched):
         write_cell(cells[1], row[COL_CASES])
         write_cell(cells[2], row[COL_PIECES])
 
-    set_column_widths(table, (Inches(2.5), Inches(2.0), Inches(2.0)))
+    set_column_widths(table, MAIN_TABLE_WIDTHS)
 
     # Items that were not found in PRODUCT_MAPPING, as a [No, Description] table
     if unmatched:
@@ -484,7 +505,7 @@ def build_docx(rows, unmatched):
             write_cell(r_cells[0], item_no)
             write_cell(r_cells[1], desc)
 
-        set_column_widths(missing_table, (Inches(1.0), Inches(5.0)))
+        set_column_widths(missing_table, MISSING_TABLE_WIDTHS)
 
     stream = io.BytesIO()
     doc.save(stream)
@@ -492,20 +513,296 @@ def build_docx(rows, unmatched):
 
 
 # --------------------------------------------------------------------------
-# Streamlit UI
+# Item count summary (PDF vs Word)
 # --------------------------------------------------------------------------
-# Changes whenever this file changes, so a cached result from an older version of
-# the code can never be shown again (st.cache_data only tracks the function's own
-# source, not the helpers it calls). Must NOT start with "_" or it is ignored.
-CODE_VERSION = hashlib.md5(Path(__file__).read_bytes()).hexdigest()
+def count_word_items(docx_bytes):
+    """Number of item rows in the converted table of the generated Word file.
+    The file is re-opened and counted, so this is what is really inside it."""
+    if not docx_bytes:
+        return 0
+    table = Document(io.BytesIO(docx_bytes)).tables[0]
+    return max(len(table.rows) - 1, 0)  # minus the header row
+
+
+def build_summary(pdf_items, docx_bytes):
+    """pdf_items  - total items in the input PDF
+    word_items - total items in the Word file
+    missing    - items that did not make it into the Word file (0 when none)"""
+    word_items = count_word_items(docx_bytes)
+    return {
+        "pdf_items": pdf_items,
+        "word_items": word_items,
+        "missing": max(pdf_items - word_items, 0),
+    }
+
+
+# --------------------------------------------------------------------------
+# Streamlit UI  (soft, glass-style look)
+# --------------------------------------------------------------------------
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+Sinhala:wght@400;500;600;700&display=swap');
+
+:root {
+  --ink: #2f3356;
+  --muted: #7377a0;
+  --glass: rgba(255, 255, 255, 0.55);
+  --glass-strong: rgba(255, 255, 255, 0.78);
+  --edge: rgba(255, 255, 255, 0.85);
+  --shadow: 0 10px 40px rgba(112, 120, 190, 0.16);
+  --radius: 24px;
+  --lav: #e7eaff;   --lav-ink: #5561c7;
+  --mint: #dcf6ec;  --mint-ink: #2c8a68;
+  --peach: #ffe9dd; --peach-ink: #c0623a;
+}
+
+html, body, .stApp {
+  font-family: 'Inter', 'Noto Sans Sinhala', 'Iskoola Pota', 'Nirmala UI', system-ui, sans-serif;
+  color-scheme: light;
+}
+.stApp {
+  background:
+    radial-gradient(900px 520px at 6% -8%, #d8e1ff 0%, rgba(216, 225, 255, 0) 60%),
+    radial-gradient(800px 480px at 100% 2%, #ffe0ef 0%, rgba(255, 224, 239, 0) 60%),
+    radial-gradient(900px 600px at 55% 112%, #d2f4ea 0%, rgba(210, 244, 234, 0) 60%),
+    #f5f6fc;
+  background-attachment: fixed;
+  color: var(--ink);
+}
+.stApp p, .stApp label, .stApp li { color: var(--ink); }
+
+/* hide default Streamlit chrome so it feels like a real app */
+#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent !important; }
+.block-container { max-width: 940px; padding: 2.4rem 1.5rem 4rem; }
+
+/* ---------- hero ---------- */
+.hero {
+  display: flex; align-items: center; gap: 1.2rem;
+  background: var(--glass);
+  backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%);
+  border: 1px solid var(--edge); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 1.5rem 1.7rem; margin-bottom: 1.1rem;
+}
+.hero-icon {
+  flex: 0 0 auto; width: 64px; height: 64px; border-radius: 20px;
+  display: flex; align-items: center; justify-content: center; font-size: 30px;
+  background: linear-gradient(145deg, #dfe5ff, #f1e6ff);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 8px 20px rgba(143, 160, 255, 0.25);
+}
+.hero-title { font-size: 1.55rem; font-weight: 700; line-height: 1.3; color: var(--ink); }
+.hero-sub { margin-top: 0.25rem; font-size: 0.98rem; color: var(--muted); }
+
+/* ---------- steps ---------- */
+.steps { display: flex; align-items: center; justify-content: center; gap: 0.6rem; flex-wrap: wrap; margin: 0.2rem 0 1.1rem; }
+.step {
+  display: flex; align-items: center; gap: 0.55rem; padding: 0.42rem 0.95rem 0.42rem 0.45rem;
+  border-radius: 999px; font-size: 0.9rem; font-weight: 500; color: var(--muted);
+  background: rgba(255, 255, 255, 0.45); border: 1px solid var(--edge);
+}
+.step-dot {
+  width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 0.78rem; font-weight: 600; background: #e9ebf7; color: var(--muted);
+}
+.step.active { color: var(--lav-ink); background: var(--glass-strong); box-shadow: 0 6px 18px rgba(143, 160, 255, 0.22); }
+.step.active .step-dot { background: linear-gradient(135deg, #8fa0ff, #b79cff); color: #fff; }
+.step.done { color: var(--mint-ink); }
+.step.done .step-dot { background: var(--mint); color: var(--mint-ink); }
+.step-line { width: 26px; height: 2px; border-radius: 2px; background: rgba(143, 160, 255, 0.28); }
+
+/* ---------- file uploader ---------- */
+[data-testid="stFileUploader"] label,
+[data-testid="stFileUploader"] label p { color: var(--ink) !important; font-weight: 600; }
+[data-testid="stFileUploaderDropzone"] {
+  background: var(--glass) !important;
+  backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+  border: 2px dashed #b9c1f2 !important; border-radius: var(--radius) !important;
+  padding: 1.7rem 1.5rem !important; transition: all 0.25s ease;
+}
+[data-testid="stFileUploaderDropzone"]:hover {
+  border-color: #8f9bf0 !important; background: var(--glass-strong) !important; box-shadow: var(--shadow);
+}
+[data-testid="stFileUploaderDropzone"] *,
+[data-testid="stFileUploaderDropzone"] small { color: var(--muted) !important; }
+[data-testid="stFileUploaderDropzone"] button {
+  border-radius: 999px !important; border: 0 !important; padding: 0.5rem 1.3rem !important; font-weight: 600;
+  background: linear-gradient(135deg, #7385f2, #9d80f7) !important;
+  box-shadow: 0 8px 20px rgba(143, 160, 255, 0.35);
+}
+[data-testid="stFileUploaderDropzone"] button,
+[data-testid="stFileUploaderDropzone"] button * { color: #ffffff !important; }
+[data-testid="stFileUploaderFile"], [data-testid="stFileChip"] {
+  background: var(--glass-strong) !important; border: 1px solid var(--edge) !important; border-radius: 16px !important;
+  box-shadow: 0 4px 14px rgba(112, 120, 190, 0.10);
+}
+[data-testid="stFileUploaderFile"] *, [data-testid="stFileChip"] * { color: var(--ink) !important; }
+[data-testid="stFileChip"] > div:first-child { background: var(--lav) !important; border-radius: 12px !important; }
+[data-testid="stFileChip"] svg { color: var(--lav-ink) !important; }
+[data-testid="stFileChipName"] { font-weight: 600; }
+/* remove (x) and add (+) buttons: soft, not the big gradient pill */
+[data-testid="stFileChipDeleteBtn"] button, [data-testid="stFileUploaderDeleteBtn"] button,
+[data-testid="stBaseButton-borderlessIcon"] {
+  background: rgba(255, 255, 255, 0.85) !important; box-shadow: none !important; padding: 0.25rem 0.6rem !important;
+}
+[data-testid="stFileChipDeleteBtn"] button *, [data-testid="stFileUploaderDeleteBtn"] button *,
+[data-testid="stBaseButton-borderlessIcon"], [data-testid="stBaseButton-borderlessIcon"] * {
+  color: var(--lav-ink) !important;
+}
+[data-testid="stSpinner"] * { color: var(--muted) !important; }
+
+/* ---------- status pills ---------- */
+.status {
+  display: flex; align-items: center; gap: 0.6rem; padding: 0.8rem 1.15rem; margin-bottom: 0.7rem;
+  border-radius: 18px; font-size: 0.97rem; font-weight: 500;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--edge); box-shadow: 0 6px 22px rgba(112, 120, 190, 0.10);
+}
+.status.ok   { background: rgba(220, 246, 236, 0.75); color: var(--mint-ink); }
+.status.warn { background: rgba(255, 233, 221, 0.80); color: var(--peach-ink); }
+
+/* ---------- cards ---------- */
+.glass {
+  background: var(--glass);
+  backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%);
+  border: 1px solid var(--edge); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 1.25rem 1.4rem;
+}
+.section-title { font-size: 1.05rem; font-weight: 600; color: var(--ink); margin: 1.2rem 0 0.7rem; }
+.section-hint { font-size: 0.88rem; color: var(--muted); margin: -0.3rem 0 0.7rem; }
+
+.stat-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.stat {
+  border-radius: var(--radius); padding: 1.15rem 1.3rem 1.05rem; border: 1px solid var(--edge);
+  backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+  box-shadow: var(--shadow); transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.stat:hover { transform: translateY(-3px); box-shadow: 0 16px 44px rgba(112, 120, 190, 0.22); }
+.stat-icon {
+  width: 40px; height: 40px; border-radius: 14px; display: flex; align-items: center; justify-content: center;
+  font-size: 19px; background: rgba(255, 255, 255, 0.75); margin-bottom: 0.7rem;
+}
+.stat-num { font-size: 2.5rem; font-weight: 700; line-height: 1.05; }
+.stat-label { margin-top: 0.4rem; font-size: 0.95rem; font-weight: 600; color: var(--ink); }
+.stat-sub { font-size: 0.8rem; color: var(--muted); margin-top: 0.1rem; }
+.stat.lav  { background: linear-gradient(150deg, rgba(231, 234, 255, 0.92), rgba(255, 255, 255, 0.5)); }
+.stat.lav .stat-num { color: var(--lav-ink); }
+.stat.mint { background: linear-gradient(150deg, rgba(220, 246, 236, 0.92), rgba(255, 255, 255, 0.5)); }
+.stat.mint .stat-num { color: var(--mint-ink); }
+.stat.ok   { background: linear-gradient(150deg, rgba(220, 246, 236, 0.92), rgba(255, 255, 255, 0.5)); }
+.stat.ok .stat-num { color: var(--mint-ink); }
+.stat.warn { background: linear-gradient(150deg, rgba(255, 233, 221, 0.95), rgba(255, 255, 255, 0.5)); }
+.stat.warn .stat-num { color: var(--peach-ink); }
+
+/* ---------- tables ---------- */
+.table-wrap {
+  max-height: 430px; overflow: auto; border-radius: 18px;
+  border: 1px solid var(--edge); background: rgba(255, 255, 255, 0.5);
+}
+.table-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+.table-wrap::-webkit-scrollbar-thumb { background: rgba(143, 160, 255, 0.35); border-radius: 8px; }
+table.glass-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.95rem; color: var(--ink); }
+table.glass-table thead th {
+  position: sticky; top: 0; z-index: 1; text-align: left !important; padding: 0.75rem 1.05rem;
+  font-weight: 600; color: var(--lav-ink); background: rgba(233, 236, 255, 0.96);
+}
+table.glass-table th, table.glass-table td { border: 0 !important; }
+table.glass-table td { padding: 0.6rem 1.05rem; border-top: 1px solid rgba(160, 168, 220, 0.18) !important; }
+table.glass-table tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.4); }
+table.glass-table tbody tr:hover td { background: rgba(200, 208, 255, 0.28); }
+
+/* ---------- download button ---------- */
+.stDownloadButton button, [data-testid="stDownloadButton"] button {
+  background: linear-gradient(135deg, #7385f2 0%, #9d80f7 100%) !important;
+  border: 0 !important; border-radius: 18px !important; padding: 0.95rem 1.4rem !important;
+  font-weight: 600; font-size: 1rem; box-shadow: 0 12px 28px rgba(115, 133, 242, 0.38);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.stDownloadButton button:hover, [data-testid="stDownloadButton"] button:hover {
+  transform: translateY(-2px); box-shadow: 0 16px 34px rgba(143, 160, 255, 0.5);
+}
+.stDownloadButton button *, [data-testid="stDownloadButton"] button * { color: #ffffff !important; }
+
+@media (max-width: 720px) {
+  .stat-grid { grid-template-columns: 1fr; }
+  .hero { flex-direction: column; text-align: center; }
+}
+"""
+
+
+def html_table(df):
+    """DataFrame -> styled, scrollable HTML table (text is escaped, so PDF content can't inject HTML)."""
+    html = df.to_html(index=False, border=0, classes="glass-table", escape=True)
+    return '<div class="table-wrap">' + re.sub(r">\s+<", "><", html) + "</div>"
+
+
+def hero_html():
+    return (
+        '<div class="hero"><div class="hero-icon">📋</div><div>'
+        '<div class="hero-title">පික් ලිස්ට් එකේ බඩු පරිවර්තකය</div>'
+        '<div class="hero-sub">ඔබේ Picklist PDF එක සිංහල Word ගොනුවක් බවට ක්ෂණිකව පරිවර්තනය කරන්න</div>'
+        "</div></div>"
+    )
+
+
+def steps_html(active):
+    labels = ["PDF තෝරන්න", "පරිවර්තනය", "Word බාගත කරන්න"]
+    parts = []
+    for i, label in enumerate(labels, start=1):
+        state = "done" if i < active else ("active" if i == active else "")
+        mark = "✓" if i < active else str(i)
+        parts.append(f'<div class="step {state}"><span class="step-dot">{mark}</span>{label}</div>')
+        if i < len(labels):
+            parts.append('<div class="step-line"></div>')
+    return '<div class="steps">' + "".join(parts) + "</div>"
+
+
+def stat_card(tone, icon, number, label_si, label_en):
+    return (
+        f'<div class="stat {tone}"><div class="stat-icon">{icon}</div>'
+        f'<div class="stat-num">{number}</div>'
+        f'<div class="stat-label">{label_si}</div>'
+        f'<div class="stat-sub">{label_en}</div></div>'
+    )
+
+
+def summary_html(summary):
+    missing = summary["missing"]
+    return (
+        '<div class="stat-grid">'
+        + stat_card("lav", "📄", summary["pdf_items"], "PDF එකේ මුළු භාණ්ඩ ගණන", "Total items in PDF")
+        + stat_card("mint", "📝", summary["word_items"], "Word එකේ මුළු භාණ්ඩ ගණන", "Total items in Word file")
+        + stat_card(
+            "ok" if missing == 0 else "warn",
+            "✅" if missing == 0 else "⚠️",
+            missing,
+            "මගහැරුණු භාණ්ඩ ගණන",
+            "Missing items" if missing else "Nothing missing",
+        )
+        + "</div>"
+    )
+
+
+def unmatched_html(unmatched):
+    df = pd.DataFrame(unmatched, columns=["No", "Description"])
+    return (
+        '<div class="section-title">⚠️ නාමාවලියේ නැති අයිතම</div>'
+        '<div class="section-hint">මේවා PRODUCT_MAPPING එකට එක් කළ විට Word ගොනුවට ඇතුළත් වේ.</div>'
+        + html_table(df)
+    )
 
 
 @st.cache_data(show_spinner=False)
 def process_pdf(pdf_bytes, code_version):
     """Cached, so clicking the download button doesn't re-parse the PDF."""
-    rows, unmatched = parse_picklist(pdf_bytes)
+    rows, unmatched, pdf_items = parse_picklist(pdf_bytes)
     docx_bytes = build_docx(rows, unmatched) if rows else None
-    return rows, unmatched, docx_bytes
+    summary = build_summary(pdf_items, docx_bytes)
+    return rows, unmatched, docx_bytes, summary
+
+
+# Changes whenever this file changes, so a cached result from an older version of
+# the code can never be shown again (st.cache_data only tracks the function's own
+# source, not the helpers it calls). Must NOT start with "_" or it is ignored.
+CODE_VERSION = hashlib.md5(Path(__file__).read_bytes()).hexdigest()
 
 
 def stretch_kwargs():
@@ -515,15 +812,13 @@ def stretch_kwargs():
     return {"use_container_width": True}
 
 
-def show_unmatched(unmatched):
-    if unmatched:
-        with st.expander(f"⚠️ නාමාවලියේ නැති අයිතම ({len(unmatched)}) බලන්න"):
-            st.dataframe(pd.DataFrame(unmatched, columns=["No", "Description"]))
-
-
 def main():
-    st.title("📋 පික් ලිස්ට් එකේ බඩු පරිවර්තකය")
-    st.write("ඔබේ Picklist PDF එක සිංහල Word ගොනුවක් බවට ක්ෂණිකව පරිවර්තනය කරන්න")
+    st.set_page_config(page_title="පික් ලිස්ට් පරිවර්තකය", page_icon="📋", layout="centered")
+    st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
+    st.markdown(hero_html(), unsafe_allow_html=True)
+
+    steps_slot = st.empty()
+    steps_slot.markdown(steps_html(1), unsafe_allow_html=True)
 
     uploaded_file = st.file_uploader(
         "පරිවර්තනය සඳහා PDF ගොනුවක් තෝරන්න (Select PDF File)", type=["pdf"]
@@ -531,39 +826,47 @@ def main():
     if uploaded_file is None:
         return
 
+    steps_slot.markdown(steps_html(2), unsafe_allow_html=True)
     with st.spinner("දත්ත විශ්ලේෂණය කරමින් පවතී..."):
-        rows, unmatched, docx_bytes = process_pdf(uploaded_file.getvalue(), CODE_VERSION)
+        rows, unmatched, docx_bytes, summary = process_pdf(uploaded_file.getvalue(), CODE_VERSION)
+    steps_slot.markdown(steps_html(3 if rows else 2), unsafe_allow_html=True)
 
     matched_count = len(rows)
-    missing_count = len(unmatched)
-    total_product_lines = matched_count + missing_count
 
     if matched_count == 0:
-        st.error("⚠️ දෝෂයකි: අප්ලෝඩ් කරන ලද PDF ගොනුවේ අදාළ වගුව තුළ කිසිදු භාණ්ඩයක් අපගේ නාමාවලිය සමඟ ගැළපුණේ නැත.")
-        show_unmatched(unmatched)
+        st.markdown(
+            '<div class="status warn">⚠️ දෝෂයකි: අප්ලෝඩ් කරන ලද PDF ගොනුවේ අදාළ වගුව තුළ '
+            "කිසිදු භාණ්ඩයක් අපගේ නාමාවලිය සමඟ ගැළපුණේ නැත.</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(summary_html(summary), unsafe_allow_html=True)
+        if unmatched:
+            st.markdown(unmatched_html(unmatched), unsafe_allow_html=True)
         return
 
-    st.success(f"🎉 සාර්ථකයි! ගැළපෙන භාණ්ඩ පේළි {matched_count} ක් සාර්ථකව පරිවර්තනය කරන ලදී.")
-
-    st.info(
-        f"📊 **සංසන්දන වාර්තාව (Comparison Summary):**\n"
-        f"- නිශ්චිත වගුවේ තිබූ මුළු භාණ්ඩ පේළි ගණන: **{total_product_lines}**\n"
-        f"- සාර්ථකව ගැළපුණු භාණ්ඩ සංඛ්‍යාව: **{matched_count}**\n"
-        f"- මගහැරුණු / නාමාවලියේ නැති අයිතම සංඛ්‍යාව: **{missing_count}**"
+    st.markdown(
+        f'<div class="status ok">🎉 සාර්ථකයි! ගැළපෙන භාණ්ඩ පේළි {matched_count} ක් සාර්ථකව පරිවර්තනය කරන ලදී.</div>',
+        unsafe_allow_html=True,
     )
-
+    if summary["missing"]:
+        st.markdown(
+            f'<div class="status warn">⚠️ නාමාවලියේ නැති භාණ්ඩ {summary["missing"]} ක් මගහැරී ඇත. පහත ලැයිස්තුව බලන්න.</div>',
+            unsafe_allow_html=True,
+        )
     unreadable = sum(1 for r in rows if "?" in (r[COL_CASES], r[COL_PIECES]))
     if unreadable:
-        st.warning(
-            f"⚠️ ප්‍රමාණ කියවා ගැනීමට නොහැකි වූ පේළි {unreadable} ක් ඇත "
-            f"(වගුවේ ? ලෙස සලකුණු කර ඇත). කරුණාකර PDF එක සමඟ පරීක්ෂා කරන්න."
+        st.markdown(
+            f'<div class="status warn">⚠️ ප්‍රමාණ කියවා ගැනීමට නොහැකි වූ පේළි {unreadable} ක් ඇත '
+            "(වගුවේ ? ලෙස සලකුණු කර ඇත). කරුණාකර PDF එක සමඟ පරීක්ෂා කරන්න.</div>",
+            unsafe_allow_html=True,
         )
 
-    st.subheader("දත්ත පෙරදසුන (Data Preview)")
-    st.dataframe(pd.DataFrame(rows))
+    st.markdown(
+        '<div class="section-title">📊 සංසන්දන වාර්තාව (Comparison Summary)</div>' + summary_html(summary),
+        unsafe_allow_html=True,
+    )
 
-    show_unmatched(unmatched)
-
+    st.write("")
     st.download_button(
         label="📥 නිපදවන ලද Word ලිපිගොනුව බාගත කරගන්න (Download Word Document)",
         data=docx_bytes,
@@ -571,6 +874,14 @@ def main():
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         **stretch_kwargs(),
     )
+
+    st.markdown(
+        '<div class="section-title">🔎 දත්ත පෙරදසුන (Data Preview)</div>' + html_table(pd.DataFrame(rows)),
+        unsafe_allow_html=True,
+    )
+
+    if unmatched:
+        st.markdown(unmatched_html(unmatched), unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
