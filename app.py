@@ -252,13 +252,21 @@ def is_boilerplate(line):
             return True
     return False
 
-def extract_item_name_only(raw_line):
-    """Isolate and clean up just the product description text from a table line entry."""
-    # Remove leading numeric index/code patterns if present (e.g., '1 ', 'F15510210 ')
+def extract_no_and_description(raw_line):
+    """Extracts [No, Description] pair from the raw PDF line."""
+    tokens = raw_line.strip().split()
+    if not tokens:
+        return "", ""
+    
+    # First token is usually the line number/index (e.g., '1' or '2')
+    item_no = tokens[0]
+    
+    # Rest of the line is cleaned up description
     cleaned = re.sub(r'^[A-Z0-9]+\s+', '', raw_line.strip())
-    # Strip trailing numbers/quantities leaving only the item name
     parts = re.split(r'\s+\d+', cleaned)
-    return parts[0].strip().upper()
+    description = parts[0].strip().upper()
+    
+    return item_no, description
 
 # App Interface Titles
 st.title("📋 පික් ලිස්ට් එකේ බඩු පරිවර්තකය")
@@ -296,7 +304,7 @@ if uploaded_file is not None:
         total_product_lines = 0
         preview_data = []
         processed_lines = set()
-        unmatched_items = []  # Stores clean item names only
+        unmatched_items = []  # Stores (no, description) tuples
         
         in_target_table = False  
         
@@ -374,14 +382,13 @@ if uploaded_file is not None:
                             break 
                     
                     if not line_matched:
-                        # Extract and add only the clean item name string
-                        clean_name = extract_item_name_only(normalized_line)
-                        if clean_name and len(clean_name) > 2:
-                            unmatched_items.append(clean_name)
+                        item_no, description = extract_no_and_description(normalized_line)
+                        if description and len(description) > 2:
+                            unmatched_items.append((item_no, description))
 
     missing_count = len(unmatched_items)
 
-    # Append only clean item names point-wise at the bottom of the Word document in Font 16
+    # Append missing items in [no, Description] format using a clean sub-table at the bottom of the Word document
     if unmatched_items:
         doc.add_paragraph() 
         heading_para = doc.add_paragraph()
@@ -389,10 +396,31 @@ if uploaded_file is not None:
         run_h.font.size = Pt(16)
         run_h.font.bold = True
         
-        for item in unmatched_items:
-            p = doc.add_paragraph(style='List Bullet')
-            r = p.add_run(item)
-            r.font.size = Pt(16)
+        missing_table = doc.add_table(rows=1, cols=2)
+        missing_table.style = 'Table Grid'
+        
+        m_widths = (Inches(1.0), Inches(5.0))
+        for row in missing_table.rows:
+            for idx, width in enumerate(m_widths):
+                row.cells[idx].width = width
+                
+        m_hdr = missing_table.rows[0].cells
+        m_hdr[0].text = "No"
+        m_hdr[1].text = "Description"
+        for cell in m_hdr:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.size = Pt(16)
+                    run.font.bold = True
+                    
+        for item_no, desc in unmatched_items:
+            r_cells = missing_table.add_row().cells
+            r_cells[0].text = item_no
+            r_cells[1].text = desc
+            for cell in r_cells:
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.size = Pt(16)
 
     if matched_count > 0:
         st.success(f"🎉 සාර්ථකයි! ගැළපෙන භාණ්ඩ පේළි {matched_count} ක් සාර්ථකව පරිවර්තනය කරන ලදී.")
