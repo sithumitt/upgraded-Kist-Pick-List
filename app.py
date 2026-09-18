@@ -108,7 +108,7 @@ PRODUCT_MAPPING = {
     "soya sauce squeeasy 180ml": "සෝස් පැකට් 180ml",
     "tomato sachet 15g": "සෝස් පැකට් 15",
     "tomato sauce 110gr - pouch": "සෝස් පැකට් 110",
-    "tomato sauce 400g - pouch": "සෝස් පැකට් 400",
+    "tomato sauce 400g - pouch": "සෝස් පැක්ට් 400",
     "tomato sauce 400g ": "සෝස් වීදුරු බෝතලේ 400 ",
     "tomato sauce 200gr ": "සෝස් වීදුරු බෝතලේ 200 ",
     "vanilla wafer 40gm": "වැනිලා වේපස් 40",
@@ -252,6 +252,14 @@ def is_boilerplate(line):
             return True
     return False
 
+def extract_item_name_only(raw_line):
+    """Isolate and clean up just the product description text from a table line entry."""
+    # Remove leading numeric index/code patterns if present (e.g., '1 ', 'F15510210 ')
+    cleaned = re.sub(r'^[A-Z0-9]+\s+', '', raw_line.strip())
+    # Strip trailing numbers/quantities leaving only the item name
+    parts = re.split(r'\s+\d+', cleaned)
+    return parts[0].strip().upper()
+
 # App Interface Titles
 st.title("📋 පික් ලිස්ට් එකේ බඩු පරිවර්තකය")
 st.write("ඔබේ Picklist PDF එක සිංහල Word ගොනුවක් බවට ක්ෂණිකව පරිවර්තනය කරන්න")
@@ -288,7 +296,7 @@ if uploaded_file is not None:
         total_product_lines = 0
         preview_data = []
         processed_lines = set()
-        unmatched_lines = []  
+        unmatched_items = []  # Stores clean item names only
         
         in_target_table = False  
         
@@ -366,18 +374,22 @@ if uploaded_file is not None:
                             break 
                     
                     if not line_matched:
-                        unmatched_lines.append(normalized_line)
+                        # Extract and add only the clean item name string
+                        clean_name = extract_item_name_only(normalized_line)
+                        if clean_name and len(clean_name) > 2:
+                            unmatched_items.append(clean_name)
 
-    missing_count = len(unmatched_lines)
+    missing_count = len(unmatched_items)
 
-    if unmatched_lines:
+    # Append only clean item names point-wise at the bottom of the Word document in Font 16
+    if unmatched_items:
         doc.add_paragraph() 
         heading_para = doc.add_paragraph()
         run_h = heading_para.add_run("Unmatched Items:")
         run_h.font.size = Pt(16)
         run_h.font.bold = True
         
-        for item in unmatched_lines:
+        for item in unmatched_items:
             p = doc.add_paragraph(style='List Bullet')
             r = p.add_run(item)
             r.font.size = Pt(16)
