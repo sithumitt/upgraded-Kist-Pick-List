@@ -228,7 +228,7 @@ PRODUCT_MAPPING = {
     "milca full cream 400g": "මිල්කා ෆුල් ක්‍රීම් 400",
     "chicken flv noodles 85g": "චිකන් නූඩ්ල්ස් 85",
     "vegetable flv noodles 85g": "වෙස්ටබල් නූඩ්ල්ස් 85",
-    "prawn flv noodles 85g": "প্রෝන් නූඩ්ල්ස් 85",
+    "prawn flv noodles 85g": "ප්‍රෝන් නූඩ්ල්ස් 85",
     "dry noodles 400g": "ඩ්‍රයි නූඩ්ල්ස් 400"
 }
 
@@ -239,11 +239,12 @@ def clean_text_for_matching(text):
     return " ".join(cleaned.lower().split())
 
 def is_boilerplate(line):
-    """Filter out invoice/table headers, UI labels, and empty metadata lines."""
+    """Filter out table headers or generic UI tags."""
     lower_line = line.lower()
     boilerplate_keywords = [
         "product code", "product description", "select product", 
-        "filter", "page", "date", "invoice", "customer"
+        "filter", "mrp", "conv.", "selling qty", "sampling qty", 
+        "total qty", "batch", "expiry date", "page", "date"
     ]
     if not line.strip() or len(line.strip()) < 3:
         return True
@@ -290,7 +291,9 @@ if uploaded_file is not None:
         total_product_lines = 0
         preview_data = []
         processed_lines = set()
-        unmatched_lines = []  # To track actual product lines that failed to match
+        unmatched_lines = []  # To track actual valid product lines that failed to match
+        
+        in_target_table = False  # Flag to track whether we are inside the target item table
         
         # Parse PDF Document content
         with pdfplumber.open(uploaded_file) as pdf:
@@ -302,8 +305,23 @@ if uploaded_file is not None:
                 lines = text_content.split('\n')
                 for line_idx, line in enumerate(lines):
                     normalized_line = line.replace('"', '').strip()
+                    lower_line = normalized_line.lower()
                     
-                    # Ignore invoice table headers, empty lines, and filter labels
+                    # Section switcher logic: Ignore Invoice/Customer block
+                    if "invoice" in lower_line or "customer name" in lower_line or "sales route" in lower_line:
+                        in_target_table = False
+                        continue
+                    
+                    # Section switcher logic: Enter the Target Item Table block
+                    if "product description" in lower_line or "selling qty" in lower_line or "total qty" in lower_line:
+                        in_target_table = True
+                        continue
+                    
+                    # Skip parsing if we are not inside the correct item table section
+                    if not in_target_table:
+                        continue
+                    
+                    # Ignore table header rows or column descriptions
                     if is_boilerplate(normalized_line):
                         continue
                         
@@ -356,17 +374,17 @@ if uploaded_file is not None:
                             matched_count += 1
                             break 
                     
-                    # If it's a product line but didn't match the dictionary, record it as unmatched
+                    # If it's a product line inside the target table but didn't match the dictionary
                     if not line_matched:
                         unmatched_lines.append(normalized_line)
 
     missing_count = len(unmatched_lines)
 
-    # Append unmatched product names point-wise at the bottom of the Word document
+    # Append unmatched product names point-wise at the bottom of the Word document in Font 16
     if unmatched_lines:
         doc.add_paragraph() # Spacing
         heading_para = doc.add_paragraph()
-        run_h = heading_para.add_run("হඳුනා නොගත් / මගහැරුණු අයිතම (Unmatched Items):")
+        run_h = heading_para.add_run("හඳුනා නොගත් / මගහැරුණු අයිතම (Unmatched Items):")
         run_h.font.size = Pt(16)
         run_h.font.bold = True
         
@@ -380,7 +398,7 @@ if uploaded_file is not None:
         
         # Display comparison metrics
         st.info(f"📊 **සංසන්දන වාර්තාව (Comparison Summary):**\n"
-                f"- PDF එකේ තිබූ මුළු භාණ්ඩ පේළි ගණන: **{total_product_lines}**\n"
+                f"- නිශ්චිත වගුවේ තිබූ මුළු භාණ්ඩ පේළි ගණන: **{total_product_lines}**\n"
                 f"- සාර්ථකව ගැළපුණු භාණ්ඩ සංඛ්‍යාව: **{matched_count}**\n"
                 f"- මගහැරුණු / නාමාවලියේ නැති අයිතම සංඛ්‍යාව: **{missing_count}**")
         
@@ -402,4 +420,4 @@ if uploaded_file is not None:
             use_container_width=True
         )
     else:
-        st.error("⚠️ දෝෂයකි: අප්ලෝඩ් කරන ලද PDF ගොනුවේ තිබූ කිසිදු භාණ්ඩයක් අපගේ නාමාවලිය සමඟ ගැළපුණේ නැත.")
+        st.error("⚠️ දෝෂයකි: අප්ලෝඩ් කරන ලද PDF ගොනුවේ අදාළ වගුව තුළ කිසිදු භාණ්ඩයක් අපගේ නාමාවලිය සමඟ ගැළපුණේ නැත.")
