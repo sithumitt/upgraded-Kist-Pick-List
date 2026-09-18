@@ -276,6 +276,7 @@ if uploaded_file is not None:
         total_input_lines = 0
         preview_data = []
         processed_lines = set()
+        unmatched_lines = []  # To track items present in PDF but not matched
         
         # Parse PDF Document content
         with pdfplumber.open(uploaded_file) as pdf:
@@ -287,13 +288,15 @@ if uploaded_file is not None:
                 lines = text_content.split('\n')
                 for line_idx, line in enumerate(lines):
                     cleaned_line_check = line.strip()
-                    if cleaned_line_check:
-                        total_input_lines += 1
+                    if not cleaned_line_check:
+                        continue
                         
+                    total_input_lines += 1
                     line_key = f"{page_num}-{line_idx}"
                     normalized_line = line.replace('"', '').strip()
                     matchable_line = clean_text_for_matching(normalized_line)
                     
+                    line_matched = False
                     for english_key, sinhala_val in PRODUCT_MAPPING.items():
                         matchable_key = clean_text_for_matching(english_key)
                         
@@ -306,6 +309,7 @@ if uploaded_file is not None:
                                 
                         if is_match and line_key not in processed_lines:
                             processed_lines.add(line_key)
+                            line_matched = True
                             
                             batch_match = re.search(r'\b([A-Z]{2}\d)\b', normalized_line)
                             qty1, qty2 = "0", "0"
@@ -336,16 +340,34 @@ if uploaded_file is not None:
                             preview_data.append({"භාණ්ඩය": sinhala_val, "කේස්": qty1, "කෑලි": qty2})
                             matched_count += 1
                             break 
+                    
+                    # If line didn't match any product key, track it as an unmatched item
+                    if not line_matched:
+                        # Filter out basic metadata/header lines if necessary, or collect them as missing items
+                        unmatched_lines.nsmallest if False else unmatched_lines.append(normalized_line)
 
-    # Calculate missing items count
-    missing_count = max(0, total_input_lines - matched_count)
+    # Calculate missing items count accurately based on actual unmatched rows
+    missing_count = len(unmatched_lines)
+
+    # Append unmatched/missing English names at the bottom of the Word Document point-wise
+    if unmatched_lines:
+        doc.add_paragraph() # Spacing
+        heading_para = doc.add_paragraph()
+        run_h = heading_para.add_run("ಹඳුනා නොගත් / මගහැරුණු අයිතම (Unmatched Items):")
+        run_h.font.size = Pt(16)
+        run_h.font.bold = True
+        
+        for item in unmatched_lines:
+            p = doc.add_paragraph(style='List Bullet')
+            r = p.add_run(item)
+            r.font.size = Pt(16)
 
     if matched_count > 0:
         st.success(f"🎉 සාර්ථකයි! ගැළපෙන භාණ්ඩ පේළි {matched_count} ක් සාර්ථකව පරිවර්තනය කරන ලදී.")
         
         # Display comparison metrics
         st.info(f"📊 **සංසන්දන වාර්තාව (Comparison Summary):**\n"
-                f"- මුල් PDF ගොනුවේ හඳුනාගත් මුළු පේළි ගණන: **{total_input_lines}**\n"
+                f"- මුල් PDF ගොනුවේ තිබූ මුළු පේළි ගණන: **{total_input_lines}**\n"
                 f"- සාර්ථකව ගැළපුණු භාණ්ඩ සංඛ්‍යාව: **{matched_count}**\n"
                 f"- මගහැරුණු / හඳුනා නොගත් අයිතම සංඛ්‍යාව: **{missing_count}**")
         
