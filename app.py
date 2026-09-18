@@ -352,17 +352,19 @@ def extract_quantities(line):
 
 
 def extract_no_and_description(raw_line):
-    """Extract (No, Description) from a product row that has no mapping entry.
+    """Extract (No, English description) from a product row.
     "35 F15522602 FALUDA WAFER 90GM 108.00 24 0 6 0 0 0 6 CG1 01/08/2028"
         -> ("35", "FALUDA WAFER 90GM")
-    Returns ("", "") if the line is not a product row."""
-    match = ROW_RE.match(raw_line.strip())
-    if not match:
-        return "", ""
-    item_no, _code, rest = match.groups()
+    The product code, MRP, quantities, batch and expiry date are dropped."""
+    line = raw_line.strip()
+    match = ROW_RE.match(line)
+    if match:
+        item_no, _code, rest = match.groups()
+    else:
+        item_no, rest = "", line
 
     # Strip the trailing MRP / quantities / batch code / expiry date
-    tokens = rest.split()
+    tokens = rest.replace("`", "").split()
     while tokens and (
         NUMBER_RE.match(tokens[-1])
         or DATE_RE.match(tokens[-1])
@@ -374,14 +376,17 @@ def extract_no_and_description(raw_line):
 
 
 def parse_picklist(pdf_bytes):
-    """Read the PDF and return (rows, unmatched, pdf_items).
+    """Read the PDF and return (rows, unmatched, pdf_items, english_rows).
 
-    rows       - converted items: {Sinhala name, cases, pieces}
-    unmatched  - product rows with no entry in PRODUCT_MAPPING: (no, description)
-    pdf_items  - total number of product rows found in the PDF's item table
+    rows          - converted items for the Sinhala file: {Sinhala name, cases, pieces}
+    unmatched     - product rows with no entry in PRODUCT_MAPPING: (no, description)
+    pdf_items     - total number of product rows found in the PDF's item table
+    english_rows  - EVERY product row as (name as printed in the PDF, cases, pieces),
+                    for the English file (no mapping needed)
     """
     rows = []
     unmatched = []
+    english_rows = []
     pdf_items = 0
     in_target_table = False
 
@@ -412,18 +417,21 @@ def parse_picklist(pdf_bytes):
                     continue
 
                 sinhala_val = find_sinhala_name(clean_text_for_matching(normalized_line))
-                if sinhala_val:
-                    pdf_items += 1
-                    qty1, qty2 = extract_quantities(normalized_line)
-                    rows.append({COL_ITEM: sinhala_val, COL_CASES: qty1, COL_PIECES: qty2})
-                elif looks_like_row:
-                    # Only real product rows count as "missing"; page headers, unit
-                    # rows and totals are ignored.
-                    pdf_items += 1
-                    item_no, description = extract_no_and_description(normalized_line)
-                    unmatched.append((item_no, description or normalized_line.upper()))
+                if not (sinhala_val or looks_like_row):
+                    continue  # page headers, unit rows, totals ...
 
-    return rows, unmatched, pdf_items
+                pdf_items += 1
+                qty1, qty2 = extract_quantities(normalized_line)
+                item_no, description = extract_no_and_description(normalized_line)
+                description = description or normalized_line.upper()
+                english_rows.append((description, qty1, qty2))
+
+                if sinhala_val:
+                    rows.append({COL_ITEM: sinhala_val, COL_CASES: qty1, COL_PIECES: qty2})
+                else:
+                    unmatched.append((item_no, description))
+
+    return rows, unmatched, pdf_items, english_rows
 
 
 # --------------------------------------------------------------------------
@@ -472,22 +480,36 @@ def set_column_widths(table, widths):
         tbl_w.set(qn("w:w"), str(sum(w.twips for w in widths)))
 
 
-def build_docx(rows, unmatched):
-    doc = Document()
-    doc.add_heading("පික් ලිස්ට් එකේ බඩු", level=1)
-
+def add_items_table(doc, headers, body_rows):
+    """3-column table (item | cases | pieces) with the reference column widths."""
     table = doc.add_table(rows=1, cols=3)
     table.style = "Table Grid"
-    for cell, text in zip(table.rows[0].cells, (COL_ITEM, COL_CASES, COL_PIECES)):
+    for cell, text in zip(table.rows[0].cells, headers):
         write_cell(cell, text, bold=True)
-
-    for row in rows:
+    for item, cases, pieces in body_rows:
         cells = table.add_row().cells
-        write_cell(cells[0], row[COL_ITEM])
-        write_cell(cells[1], row[COL_CASES])
-        write_cell(cells[2], row[COL_PIECES])
-
+        write_cell(cells[0], item)
+        write_cell(cells[1], cases)
+        write_cell(cells[2], pieces)
     set_column_widths(table, MAIN_TABLE_WIDTHS)
+    return table
+
+
+def _save(doc):
+    stream = io.BytesIO()
+    doc.save(stream)
+    return stream.getvalue()
+
+
+def build_docx(rows, unmatched):
+    """Sinhala Word file (+ a table of items that are not in PRODUCT_MAPPING)."""
+    doc = Document()
+    doc.add_heading("පික් ලිස්ට් එකේ බඩු", level=1)
+    add_items_table(
+        doc,
+        (COL_ITEM, COL_CASES, COL_PIECES),
+        [(r[COL_ITEM], r[COL_CASES], r[COL_PIECES]) for r in rows],
+    )
 
     # Items that were not found in PRODUCT_MAPPING, as a [No, Description] table
     if unmatched:
@@ -508,9 +530,15 @@ def build_docx(rows, unmatched):
 
         set_column_widths(missing_table, MISSING_TABLE_WIDTHS)
 
-    stream = io.BytesIO()
-    doc.save(stream)
-    return stream.getvalue()
+    return _save(doc)
+
+
+def build_docx_en(english_rows):
+    """English Word file: every item, names exactly as printed in the PDF."""
+    doc = Document()
+    doc.add_heading("Picklist Items", level=1)
+    add_items_table(doc, ("Item", "Cases", "Pieces"), english_rows)
+    return _save(doc)
 
 
 # --------------------------------------------------------------------------
@@ -525,15 +553,17 @@ def count_word_items(docx_bytes):
     return max(len(table.rows) - 1, 0)  # minus the header row
 
 
-def build_summary(pdf_items, docx_bytes):
-    """pdf_items  - total items in the input PDF
-    word_items - total items in the Word file
-    missing    - items that did not make it into the Word file (0 when none)"""
+def build_summary(pdf_items, docx_bytes, docx_en_bytes=None):
+    """pdf_items     - total items in the input PDF
+    word_items    - total items in the (Sinhala) Word file
+    missing       - items that did not make it into the Sinhala Word file (0 when none)
+    english_items - total items in the English Word file"""
     word_items = count_word_items(docx_bytes)
     return {
         "pdf_items": pdf_items,
         "word_items": word_items,
         "missing": max(pdf_items - word_items, 0),
+        "english_items": count_word_items(docx_en_bytes),
     }
 
 
@@ -722,6 +752,20 @@ table.glass-table tbody tr:hover td { background: rgba(200, 208, 255, 0.28); }
 }
 .stDownloadButton button *, [data-testid="stDownloadButton"] button * { color: #ffffff !important; }
 
+/* second (English) download button: soft teal so the two options are easy to tell apart */
+.st-key-dl_en button,
+[data-testid="stColumn"]:nth-child(2) [data-testid="stDownloadButton"] button,
+[data-testid="column"]:nth-child(2) .stDownloadButton button {
+  background: linear-gradient(135deg, #4fb69a 0%, #63a4e6 100%) !important;
+  box-shadow: 0 12px 28px rgba(79, 182, 154, 0.35) !important;
+}
+.st-key-dl_en button:hover,
+[data-testid="stColumn"]:nth-child(2) [data-testid="stDownloadButton"] button:hover,
+[data-testid="column"]:nth-child(2) .stDownloadButton button:hover {
+  box-shadow: 0 16px 34px rgba(79, 182, 154, 0.5) !important;
+}
+.dl-hint { text-align: center; font-size: 0.85rem; color: var(--muted); margin-top: 0.55rem; }
+
 @media (max-width: 720px) {
   .stat-grid { grid-template-columns: 1fr; }
   .hero { flex-direction: column; text-align: center; }
@@ -794,10 +838,11 @@ def unmatched_html(unmatched):
 @st.cache_data(show_spinner=False)
 def process_pdf(pdf_bytes, code_version):
     """Cached, so clicking the download button doesn't re-parse the PDF."""
-    rows, unmatched, pdf_items = parse_picklist(pdf_bytes)
+    rows, unmatched, pdf_items, english_rows = parse_picklist(pdf_bytes)
     docx_bytes = build_docx(rows, unmatched) if rows else None
-    summary = build_summary(pdf_items, docx_bytes)
-    return rows, unmatched, docx_bytes, summary
+    docx_en_bytes = build_docx_en(english_rows) if english_rows else None
+    summary = build_summary(pdf_items, docx_bytes, docx_en_bytes)
+    return rows, unmatched, docx_bytes, docx_en_bytes, summary
 
 
 # Changes whenever this file changes, so a cached result from an older version of
@@ -811,6 +856,31 @@ def stretch_kwargs():
     if "width" in inspect.signature(st.download_button).parameters:
         return {"width": "stretch"}
     return {"use_container_width": True}
+
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def render_downloads(docx_si, docx_en, english_count):
+    """Two download buttons: Sinhala Word file and English Word file."""
+    label_si = "📥 සිංහල Word ගොනුව බාගත කරන්න (Sinhala)"
+    label_en = "📥 ඉංග්‍රීසි Word ගොනුව බාගත කරන්න (English)"
+    if docx_si and docx_en:
+        col_si, col_en = st.columns(2)
+        with col_si:
+            st.download_button(label_si, data=docx_si, file_name="පික්_ලිස්ට්_එකේ_බඩු.docx",
+                               mime=DOCX_MIME, key="dl_si", **stretch_kwargs())
+        with col_en:
+            st.download_button(label_en, data=docx_en, file_name="picklist_items_english.docx",
+                               mime=DOCX_MIME, key="dl_en", **stretch_kwargs())
+    elif docx_en:  # nothing matched the Sinhala catalog, but the English file still works
+        st.download_button(label_en, data=docx_en, file_name="picklist_items_english.docx",
+                           mime=DOCX_MIME, key="dl_en", **stretch_kwargs())
+    if docx_en:
+        st.markdown(
+            f'<div class="dl-hint">ඉංග්‍රීසි ගොනුවේ PDF එකේ ඇති සියලුම භාණ්ඩ {english_count} ම ඇතුළත් වේ.</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def main():
@@ -829,7 +899,7 @@ def main():
 
     steps_slot.markdown(steps_html(2), unsafe_allow_html=True)
     with st.spinner("දත්ත විශ්ලේෂණය කරමින් පවතී..."):
-        rows, unmatched, docx_bytes, summary = process_pdf(uploaded_file.getvalue(), CODE_VERSION)
+        rows, unmatched, docx_bytes, docx_en_bytes, summary = process_pdf(uploaded_file.getvalue(), CODE_VERSION)
     steps_slot.markdown(steps_html(3 if rows else 2), unsafe_allow_html=True)
 
     matched_count = len(rows)
@@ -841,6 +911,8 @@ def main():
             unsafe_allow_html=True,
         )
         st.markdown(summary_html(summary), unsafe_allow_html=True)
+        st.write("")
+        render_downloads(None, docx_en_bytes, summary["english_items"])
         if unmatched:
             st.markdown(unmatched_html(unmatched), unsafe_allow_html=True)
         return
@@ -868,13 +940,7 @@ def main():
     )
 
     st.write("")
-    st.download_button(
-        label="📥 නිපදවන ලද Word ලිපිගොනුව බාගත කරගන්න (Download Word Document)",
-        data=docx_bytes,
-        file_name="පික්_ලිස්ට්_එකේ_බඩු.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        **stretch_kwargs(),
-    )
+    render_downloads(docx_bytes, docx_en_bytes, summary["english_items"])
 
     st.markdown(
         '<div class="section-title">🔎 දත්ත පෙරදසුන (Data Preview)</div>' + html_table(pd.DataFrame(rows)),
