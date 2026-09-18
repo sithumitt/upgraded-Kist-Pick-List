@@ -1,10 +1,26 @@
+"""Picklist PDF -> Sinhala Word (.docx) converter (Streamlit app).
+
+Run with:  streamlit run picklist_converter.py
+Needs:     pip install streamlit pdfplumber python-docx pandas
+"""
+import inspect
 import io
 import re
-import pdfplumber
+
 import pandas as pd
-from docx import Document
-from docx.shared import Inches, Pt
+import pdfplumber
 import streamlit as st
+from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt
+
+FONT_SIZE = Pt(16)
+
+# Column names used in the Word table and the on-screen preview
+COL_ITEM = "භාණ්ඩය"
+COL_CASES = "කේස්"
+COL_PIECES = "කෑලි"
 
 # Product Mapping Dictionary
 PRODUCT_MAPPING = {
@@ -23,7 +39,7 @@ PRODUCT_MAPPING = {
     "chocolate wafer 40gm": "චොකලට වේපස් 40",
     "chocolate wafer 90gm": "චොකලට වේපස් 90",
     "chocolate wafer 200gm": "චොකලට වේපස් 200",
-    "chocolate marie 100gm":"චොකලට් මාරි 100GM",
+    "chocolate marie 100gm": "චොකලට් මාරි 100GM",
     "chocolate wafer 360gm x 3pks": "චොකලට වේපස් 360",
     "cookie assortment blue 330gm": "කුකි ඇසෝඩ්මන්ට් නිල් 330",
     "coffee wafer 200gm": "කෝපි වේපර්ස්",
@@ -97,8 +113,8 @@ PRODUCT_MAPPING = {
     "s/berry melon jam cup100g": "ස්ටෝබරි ජෑම් 100 C",
     "berry flv melon jam200g": "ස්ටෝබරි ජෑම් 200",
     "berry flv melon jam300g": "ස්ටෝබරි ජෑම් 300",
-    "strawberry 200g": "ස්ටෝබරි ජෑම් 200", 
-    "strawberry 300g": "ස්ටෝබරි ජෑම් 300", 
+    "strawberry 200g": "ස්ටෝබරි ජෑම් 200",
+    "strawberry 300g": "ස්ටෝබරි ජෑම් 300",
     "sesame cookies 120gm": "සෙසමිකුකීස්",
     "strawberry sparkling 250ml": "ස්ටෝබරි ස්පාක්ලින්",
     "strawberry wafer 40gm": "ස්ටෝබරි වේපස් 40",
@@ -229,221 +245,312 @@ PRODUCT_MAPPING = {
     "chicken flv noodles 85g": "චිකන් නූඩ්ල්ස් 85",
     "vegetable flv noodles 85g": "වෙස්ටබල් නූඩ්ල්ස් 85",
     "prawn flv noodles 85g": "ප්‍රෝන් නූඩ්ල්ස් 85",
-    "dry noodles 400g": "ඩ්‍රයි නූඩ්ල්ස් 400"
+    "dry noodles 400g": "ඩ්‍රයි නූඩ්ල්ස් 400",
 }
 
+# Used only when no key in PRODUCT_MAPPING matched (e.g. "STRAWBERRY JAM 300G")
+STRAWBERRY_JAM_FALLBACK = {
+    "200": "ස්ටෝබරි ජෑම් 200",
+    "300": "ස්ටෝබරි ජෑම් 300",
+}
+
+BATCH_RE = re.compile(r"\b([A-Z]{2}\d)\b")
+NUMBER_RE = re.compile(r"^\d+(?:[.,]\d+)?$")
+DATE_RE = re.compile(
+    r"^(?:\d{1,2}[/.\-])?\d{1,2}[/.\-]\d{4}$|^\d{4}[/.\-]\d{1,2}(?:[/.\-]\d{1,2})?$"
+)
+BOILERPLATE_RE = re.compile(
+    r"\b(?:product code|product description|select product|filter|mrp|conv|"
+    r"selling qty|sampling qty|total qty|batch|expiry date|page|date|"
+    r"grand total|sub total)\b"
+)
+
+
+# --------------------------------------------------------------------------
+# Text matching
+# --------------------------------------------------------------------------
 def clean_text_for_matching(text):
     if not text:
         return ""
-    cleaned = text.replace('"', '').replace('/', ' ').replace('.', ' ').replace('-', ' ')
+    cleaned = re.sub(r'["()]', "", text)  # quotes and brackets: "(60gm)" == "60gm"
+    cleaned = cleaned.replace("/", " ").replace(".", " ").replace("-", " ")
     return " ".join(cleaned.lower().split())
 
+
+def _build_matchers(mapping):
+    """Compile every key once and sort LONGEST FIRST, so that a more specific
+    name ("chocolate shorties 270gm") always wins over a shorter name that is
+    contained in it ("shorties 270gm")."""
+    matchers = []
+    for english_key, sinhala_val in mapping.items():
+        key = clean_text_for_matching(english_key)
+        pattern = re.compile(r"(?<![a-z0-9])" + re.escape(key) + r"(?!\d)")
+        matchers.append((len(key), pattern, sinhala_val))
+    matchers.sort(key=lambda m: m[0], reverse=True)
+    return [(pattern, sinhala_val) for _, pattern, sinhala_val in matchers]
+
+
+MATCHERS = _build_matchers(PRODUCT_MAPPING)
+
+
+def strawberry_jam_fallback(cleaned_line):
+    if "strawberry" not in cleaned_line:
+        return None
+    if "wafer" in cleaned_line or "sparkling" in cleaned_line:
+        return None
+    for size, sinhala_val in STRAWBERRY_JAM_FALLBACK.items():
+        if re.search(rf"(?<!\d){size}\s?g", cleaned_line):
+            return sinhala_val
+    return None
+
+
+def find_sinhala_name(cleaned_line):
+    for pattern, sinhala_val in MATCHERS:
+        if pattern.search(cleaned_line):
+            return sinhala_val
+    return strawberry_jam_fallback(cleaned_line)
+
+
 def is_boilerplate(line):
-    lower_line = line.lower()
-    boilerplate_keywords = [
-        "product code", "product description", "select product", 
-        "filter", "mrp", "conv.", "selling qty", "sampling qty", 
-        "total qty", "batch", "expiry date", "page", "date"
-    ]
     if not line.strip() or len(line.strip()) < 3:
         return True
-    for kw in boilerplate_keywords:
-        if kw in lower_line:
-            return True
-    return False
+    return bool(BOILERPLATE_RE.search(line.lower()))
+
+
+# --------------------------------------------------------------------------
+# Line parsing
+# --------------------------------------------------------------------------
+def _fmt_qty(token):
+    token = token.replace(",", "")
+    return re.sub(r"\.0+$", "", token)  # "5.00" -> "5"
+
+
+def extract_quantities(line):
+    """Return (cases, pieces) = the last two whole-number tokens before the
+    batch code. Returns ("?", "?") when they can't be found, instead of
+    silently writing 0."""
+    batch = BATCH_RE.search(line)
+    text = line[: batch.start()] if batch else line
+    tokens = [t for t in text.split() if not DATE_RE.match(t)]
+    numbers = [t for t in tokens if NUMBER_RE.match(t)]
+    if len(numbers) < 2:
+        return "?", "?"
+    return _fmt_qty(numbers[-2]), _fmt_qty(numbers[-1])
+
 
 def extract_no_and_description(raw_line):
-    """Extracts [No, Description] pair from the raw PDF line."""
+    """Extract [No, Description] from a line that has no mapping entry.
+    The description keeps its size (e.g. "MARIE 100GM") so you can tell
+    exactly which product needs to be added to PRODUCT_MAPPING."""
     tokens = raw_line.strip().split()
     if not tokens:
         return "", ""
-    
-    # First token is usually the line number/index (e.g., '1' or '2')
-    item_no = tokens[0]
-    
-    # Rest of the line is cleaned up description
-    cleaned = re.sub(r'^[A-Z0-9]+\s+', '', raw_line.strip())
-    parts = re.split(r'\s+\d+', cleaned)
-    description = parts[0].strip().upper()
-    
-    return item_no, description
 
-# App Interface Titles
-st.title("📋 පික් ලිස්ට් එකේ බඩු පරිවර්තකය")
-st.write("ඔබේ Picklist PDF එක සිංහල Word ගොනුවක් බවට ක්ෂණිකව පරිවර්තනය කරන්න")
+    item_no = ""
+    if any(ch.isdigit() for ch in tokens[0]):
+        item_no = tokens.pop(0)
 
-# Main File Input
-uploaded_file = st.file_uploader("පරිවර්තනය සඳහා PDF ගොනුවක් තෝරන්න (Select PDF File)", type=["pdf"])
+    # Strip the trailing numbers / batch code / expiry date
+    while tokens and (
+        NUMBER_RE.match(tokens[-1])
+        or DATE_RE.match(tokens[-1])
+        or re.fullmatch(r"[A-Z]{2}\d", tokens[-1])
+    ):
+        tokens.pop()
 
-if uploaded_file is not None:
-    with st.spinner("දත්ත විශ්ලේෂණය කරමින් පවතී..."):
-        # Setup Output Word File Structure
-        doc = Document()
-        doc.add_heading('පික් ලිස්ට් එකේ බඩු', level=1)
-        
-        table = doc.add_table(rows=1, cols=3)
-        table.style = 'Table Grid'
-        
-        col_widths = (Inches(2.5), Inches(2.0), Inches(2.0))
-        for row in table.rows:
-            for idx, width in enumerate(col_widths):
-                row.cells[idx].width = width
-        
-        hdr_cells = table.rows[0].cells
-        hdr_cells[0].text = 'භාණ්ඩය'
-        hdr_cells[1].text = 'කේස්'
-        hdr_cells[2].text = 'කෑලි'
-        
-        for cell in hdr_cells:
-            for paragraph in cell.paragraphs:
-                for run in paragraph.runs:
-                    run.font.size = Pt(16)
-                    run.font.bold = True
-        
-        matched_count = 0
-        total_product_lines = 0
-        preview_data = []
-        processed_lines = set()
-        unmatched_items = []  # Stores (no, description) tuples
-        
-        in_target_table = False  
-        
-        with pdfplumber.open(uploaded_file) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                text_content = page.extract_text()
-                if not text_content:
+    return item_no, " ".join(tokens).upper()
+
+
+def parse_picklist(pdf_bytes):
+    """Read the PDF and return (rows, unmatched)."""
+    rows = []
+    unmatched = []  # (no, description)
+    in_target_table = False
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text_content = page.extract_text()
+            if not text_content:
+                continue
+
+            for line in text_content.split("\n"):
+                normalized_line = line.replace('"', "").strip()
+                lower_line = normalized_line.lower()
+
+                if any(k in lower_line for k in ("invoice", "customer name", "sales route")):
+                    in_target_table = False
                     continue
-                
-                lines = text_content.split('\n')
-                for line_idx, line in enumerate(lines):
-                    normalized_line = line.replace('"', '').strip()
-                    lower_line = normalized_line.lower()
-                    
-                    if "invoice" in lower_line or "customer name" in lower_line or "sales route" in lower_line:
-                        in_target_table = False
-                        continue
-                    
-                    if "product description" in lower_line or "selling qty" in lower_line or "total qty" in lower_line:
-                        in_target_table = True
-                        continue
-                    
-                    if not in_target_table:
-                        continue
-                    
-                    if is_boilerplate(normalized_line):
-                        continue
-                        
-                    total_product_lines += 1
-                    line_key = f"{page_num}-{line_idx}"
-                    matchable_line = clean_text_for_matching(normalized_line)
-                    
-                    line_matched = False
-                    for english_key, sinhala_val in PRODUCT_MAPPING.items():
-                        matchable_key = clean_text_for_matching(english_key)
-                        
-                        is_match = False
-                        if matchable_key in matchable_line:
-                            is_match = True
-                        elif "strawberry" in matchable_key and "300" in matchable_key:
-                            if "strawberry" in matchable_line and "300" in matchable_line:
-                                is_match = True
-                                
-                        if is_match and line_key not in processed_lines:
-                            processed_lines.add(line_key)
-                            line_matched = True
-                            
-                            batch_match = re.search(r'\b([A-Z]{2}\d)\b', normalized_line)
-                            qty1, qty2 = "0", "0"
-                            
-                            if batch_match:
-                                pre_batch_text = normalized_line[:batch_match.start()].strip()
-                                all_numbers = re.findall(r'\d+', pre_batch_text)
-                                if len(all_numbers) >= 2:
-                                    qty1 = all_numbers[-2]
-                                    qty2 = all_numbers[-1]
-                            else:
-                                all_numbers = re.findall(r'\b\d+\b', normalized_line)
-                                if len(all_numbers) >= 2:
-                                    qty1 = all_numbers[-2]
-                                    qty2 = all_numbers[-1]
-                            
-                            row_cells = table.add_row().cells
-                            row_cells[0].text = sinhala_val
-                            row_cells[1].text = qty1
-                            row_cells[2].text = qty2
-                            
-                            for cell in row_cells:
-                                for paragraph in cell.paragraphs:
-                                    for run in paragraph.runs:
-                                        run.font.size = Pt(16)
-                            
-                            preview_data.append({"භාණ්ඩය": sinhala_val, "කේස්": qty1, "කෑලි": qty2})
-                            matched_count += 1
-                            break 
-                    
-                    if not line_matched:
-                        item_no, description = extract_no_and_description(normalized_line)
-                        if description and len(description) > 2:
-                            unmatched_items.append((item_no, description))
 
-    missing_count = len(unmatched_items)
+                if any(k in lower_line for k in ("product description", "selling qty", "total qty")):
+                    in_target_table = True
+                    continue
 
-    # Append missing items in [no, Description] format using a clean sub-table at the bottom of the Word document
-    if unmatched_items:
-        doc.add_paragraph() 
+                if not in_target_table or is_boilerplate(normalized_line):
+                    continue
+
+                sinhala_val = find_sinhala_name(clean_text_for_matching(normalized_line))
+                if sinhala_val:
+                    qty1, qty2 = extract_quantities(normalized_line)
+                    rows.append({COL_ITEM: sinhala_val, COL_CASES: qty1, COL_PIECES: qty2})
+                else:
+                    item_no, description = extract_no_and_description(normalized_line)
+                    if len(description) > 2:
+                        unmatched.append((item_no, description))
+
+    return rows, unmatched
+
+
+# --------------------------------------------------------------------------
+# Word document
+# --------------------------------------------------------------------------
+def format_run(run, bold=False):
+    """Set 16pt (and bold). Sinhala is a complex script, so Word reads the
+    complex-script properties (szCs / bCs), not just sz / b. Set both."""
+    run.font.size = FONT_SIZE
+    rpr = run._element.get_or_add_rPr()
+    if rpr.find(qn("w:szCs")) is None:
+        rpr.find(qn("w:sz")).addnext(OxmlElement("w:szCs"))
+    rpr.find(qn("w:szCs")).set(qn("w:val"), str(int(FONT_SIZE.pt * 2)))
+
+    if bold:
+        run.font.bold = True
+        if rpr.find(qn("w:bCs")) is None:
+            rpr.find(qn("w:b")).addnext(OxmlElement("w:bCs"))
+
+
+def write_cell(cell, text, bold=False):
+    cell.text = str(text).strip()
+    for paragraph in cell.paragraphs:
+        for run in paragraph.runs:
+            format_run(run, bold)
+
+
+def set_column_widths(table, widths):
+    """Apply widths to the grid AND every cell (call after all rows exist;
+    rows added later don't inherit per-cell widths)."""
+    table.autofit = False
+    for idx, width in enumerate(widths):
+        table.columns[idx].width = width
+        for cell in table.columns[idx].cells:
+            cell.width = width
+
+
+def build_docx(rows, unmatched):
+    doc = Document()
+    doc.add_heading("පික් ලිස්ට් එකේ බඩු", level=1)
+
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    for cell, text in zip(table.rows[0].cells, (COL_ITEM, COL_CASES, COL_PIECES)):
+        write_cell(cell, text, bold=True)
+
+    for row in rows:
+        cells = table.add_row().cells
+        write_cell(cells[0], row[COL_ITEM])
+        write_cell(cells[1], row[COL_CASES])
+        write_cell(cells[2], row[COL_PIECES])
+
+    set_column_widths(table, (Inches(2.5), Inches(2.0), Inches(2.0)))
+
+    # Items that were not found in PRODUCT_MAPPING, as a [No, Description] table
+    if unmatched:
+        doc.add_paragraph()
         heading_para = doc.add_paragraph()
         run_h = heading_para.add_run("Unmatched Items:")
-        run_h.font.size = Pt(16)
-        run_h.font.bold = True
-        
-        missing_table = doc.add_table(rows=1, cols=2)
-        missing_table.style = 'Table Grid'
-        
-        m_widths = (Inches(1.0), Inches(5.0))
-        for row in missing_table.rows:
-            for idx, width in enumerate(m_widths):
-                row.cells[idx].width = width
-                
-        m_hdr = missing_table.rows[0].cells
-        m_hdr[0].text = "No"
-        m_hdr[1].text = "Description"
-        for cell in m_hdr:
-            for paragraph in cell.paragraphs:
-                for run in paragraph.runs:
-                    run.font.size = Pt(16)
-                    run.font.bold = True
-                    
-        for item_no, desc in unmatched_items:
-            r_cells = missing_table.add_row().cells
-            r_cells[0].text = item_no
-            r_cells[1].text = desc
-            for cell in r_cells:
-                for paragraph in cell.paragraphs:
-                    for run in paragraph.runs:
-                        run.font.size = Pt(16)
+        format_run(run_h, bold=True)
 
-    if matched_count > 0:
-        st.success(f"🎉 සාර්ථකයි! ගැළපෙන භාණ්ඩ පේළි {matched_count} ක් සාර්ථකව පරිවර්තනය කරන ලදී.")
-        
-        st.info(f"📊 **සංසන්දන වාර්තාව (Comparison Summary):**\n"
-                f"- නිශ්චිත වගුවේ තිබූ මුළු භාණ්ඩ පේළි ගණන: **{total_product_lines}**\n"
-                f"- සාර්ථකව ගැළපුණු භාණ්ඩ සංඛ්‍යාව: **{matched_count}**\n"
-                f"- මගහැරුණු / නාමාවලියේ නැති අයිතම සංඛ්‍යාව: **{missing_count}**")
-        
-        st.subheader("දත්ත පෙරදසුන (Data Preview)")
-        df_preview = pd.DataFrame(preview_data)
-        st.dataframe(df_preview, use_container_width=True)
-        
-        doc_stream = io.BytesIO()
-        doc.save(doc_stream)
-        doc_stream.seek(0)
-        
-        st.download_button(
-            label="📥 නිපදවන ලද Word ලිපිගොනුව බාගත කරගන්න (Download Word Document)",
-            data=doc_stream,
-            file_name="පික්_ලිස්ට්_එකේ_බඩු.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True
-        )
-    else:
+        missing_table = doc.add_table(rows=1, cols=2)
+        missing_table.style = "Table Grid"
+        write_cell(missing_table.rows[0].cells[0], "No", bold=True)
+        write_cell(missing_table.rows[0].cells[1], "Description", bold=True)
+
+        for item_no, desc in unmatched:
+            r_cells = missing_table.add_row().cells
+            write_cell(r_cells[0], item_no)
+            write_cell(r_cells[1], desc)
+
+        set_column_widths(missing_table, (Inches(1.0), Inches(5.0)))
+
+    stream = io.BytesIO()
+    doc.save(stream)
+    return stream.getvalue()
+
+
+# --------------------------------------------------------------------------
+# Streamlit UI
+# --------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def process_pdf(pdf_bytes):
+    """Cached, so clicking the download button doesn't re-parse the PDF."""
+    rows, unmatched = parse_picklist(pdf_bytes)
+    docx_bytes = build_docx(rows, unmatched) if rows else None
+    return rows, unmatched, docx_bytes
+
+
+def stretch_kwargs():
+    # Newer Streamlit deprecates use_container_width in favour of width="stretch"
+    if "width" in inspect.signature(st.download_button).parameters:
+        return {"width": "stretch"}
+    return {"use_container_width": True}
+
+
+def show_unmatched(unmatched):
+    if unmatched:
+        with st.expander(f"⚠️ නාමාවලියේ නැති අයිතම ({len(unmatched)}) බලන්න"):
+            st.dataframe(pd.DataFrame(unmatched, columns=["No", "Description"]))
+
+
+def main():
+    st.title("📋 පික් ලිස්ට් එකේ බඩු පරිවර්තකය")
+    st.write("ඔබේ Picklist PDF එක සිංහල Word ගොනුවක් බවට ක්ෂණිකව පරිවර්තනය කරන්න")
+
+    uploaded_file = st.file_uploader(
+        "පරිවර්තනය සඳහා PDF ගොනුවක් තෝරන්න (Select PDF File)", type=["pdf"]
+    )
+    if uploaded_file is None:
+        return
+
+    with st.spinner("දත්ත විශ්ලේෂණය කරමින් පවතී..."):
+        rows, unmatched, docx_bytes = process_pdf(uploaded_file.getvalue())
+
+    matched_count = len(rows)
+    missing_count = len(unmatched)
+    total_product_lines = matched_count + missing_count
+
+    if matched_count == 0:
         st.error("⚠️ දෝෂයකි: අප්ලෝඩ් කරන ලද PDF ගොනුවේ අදාළ වගුව තුළ කිසිදු භාණ්ඩයක් අපගේ නාමාවලිය සමඟ ගැළපුණේ නැත.")
+        show_unmatched(unmatched)
+        return
+
+    st.success(f"🎉 සාර්ථකයි! ගැළපෙන භාණ්ඩ පේළි {matched_count} ක් සාර්ථකව පරිවර්තනය කරන ලදී.")
+
+    st.info(
+        f"📊 **සංසන්දන වාර්තාව (Comparison Summary):**\n"
+        f"- නිශ්චිත වගුවේ තිබූ මුළු භාණ්ඩ පේළි ගණන: **{total_product_lines}**\n"
+        f"- සාර්ථකව ගැළපුණු භාණ්ඩ සංඛ්‍යාව: **{matched_count}**\n"
+        f"- මගහැරුණු / නාමාවලියේ නැති අයිතම සංඛ්‍යාව: **{missing_count}**"
+    )
+
+    unreadable = sum(1 for r in rows if "?" in (r[COL_CASES], r[COL_PIECES]))
+    if unreadable:
+        st.warning(
+            f"⚠️ ප්‍රමාණ කියවා ගැනීමට නොහැකි වූ පේළි {unreadable} ක් ඇත "
+            f"(වගුවේ ? ලෙස සලකුණු කර ඇත). කරුණාකර PDF එක සමඟ පරීක්ෂා කරන්න."
+        )
+
+    st.subheader("දත්ත පෙරදසුන (Data Preview)")
+    st.dataframe(pd.DataFrame(rows))
+
+    show_unmatched(unmatched)
+
+    st.download_button(
+        label="📥 නිපදවන ලද Word ලිපිගොනුව බාගත කරගන්න (Download Word Document)",
+        data=docx_bytes,
+        file_name="පික්_ලිස්ට්_එකේ_බඩු.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        **stretch_kwargs(),
+    )
+
+
+if __name__ == "__main__":
+    main()
