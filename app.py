@@ -228,7 +228,7 @@ PRODUCT_MAPPING = {
     "milca full cream 400g": "මිල්කා ෆුල් ක්‍රීම් 400",
     "chicken flv noodles 85g": "චිකන් නූඩ්ල්ස් 85",
     "vegetable flv noodles 85g": "වෙස්ටබල් නූඩ්ල්ස් 85",
-    "prawn flv noodles 85g": "ප්‍රෝන් නූඩ්ල්ස් 85",
+    "prawn flv noodles 85g": "প্রෝන් නූඩ්ල්ස් 85",
     "dry noodles 400g": "ඩ්‍රයි නූඩ්ල්ස් 400"
 }
 
@@ -237,6 +237,20 @@ def clean_text_for_matching(text):
         return ""
     cleaned = text.replace('"', '').replace('/', ' ').replace('.', ' ').replace('-', ' ')
     return " ".join(cleaned.lower().split())
+
+def is_boilerplate(line):
+    """Filter out invoice/table headers, UI labels, and empty metadata lines."""
+    lower_line = line.lower()
+    boilerplate_keywords = [
+        "product code", "product description", "select product", 
+        "filter", "page", "date", "invoice", "customer"
+    ]
+    if not line.strip() or len(line.strip()) < 3:
+        return True
+    for kw in boilerplate_keywords:
+        if kw in lower_line:
+            return True
+    return False
 
 # App Interface Titles
 st.title("📋 පික් ලිස්ට් එකේ බඩු පරිවර්තකය")
@@ -273,10 +287,10 @@ if uploaded_file is not None:
                     run.font.bold = True
         
         matched_count = 0
-        total_input_lines = 0
+        total_product_lines = 0
         preview_data = []
         processed_lines = set()
-        unmatched_lines = []  # To track items present in PDF but not matched
+        unmatched_lines = []  # To track actual product lines that failed to match
         
         # Parse PDF Document content
         with pdfplumber.open(uploaded_file) as pdf:
@@ -287,13 +301,14 @@ if uploaded_file is not None:
                 
                 lines = text_content.split('\n')
                 for line_idx, line in enumerate(lines):
-                    cleaned_line_check = line.strip()
-                    if not cleaned_line_check:
+                    normalized_line = line.replace('"', '').strip()
+                    
+                    # Ignore invoice table headers, empty lines, and filter labels
+                    if is_boilerplate(normalized_line):
                         continue
                         
-                    total_input_lines += 1
+                    total_product_lines += 1
                     line_key = f"{page_num}-{line_idx}"
-                    normalized_line = line.replace('"', '').strip()
                     matchable_line = clean_text_for_matching(normalized_line)
                     
                     line_matched = False
@@ -341,19 +356,17 @@ if uploaded_file is not None:
                             matched_count += 1
                             break 
                     
-                    # If line didn't match any product key, track it as an unmatched item
+                    # If it's a product line but didn't match the dictionary, record it as unmatched
                     if not line_matched:
-                        # Filter out basic metadata/header lines if necessary, or collect them as missing items
-                        unmatched_lines.nsmallest if False else unmatched_lines.append(normalized_line)
+                        unmatched_lines.append(normalized_line)
 
-    # Calculate missing items count accurately based on actual unmatched rows
     missing_count = len(unmatched_lines)
 
-    # Append unmatched/missing English names at the bottom of the Word Document point-wise
+    # Append unmatched product names point-wise at the bottom of the Word document
     if unmatched_lines:
         doc.add_paragraph() # Spacing
         heading_para = doc.add_paragraph()
-        run_h = heading_para.add_run("ಹඳුනා නොගත් / මගහැරුණු අයිතම (Unmatched Items):")
+        run_h = heading_para.add_run("হඳුනා නොගත් / මගහැරුණු අයිතම (Unmatched Items):")
         run_h.font.size = Pt(16)
         run_h.font.bold = True
         
@@ -367,9 +380,9 @@ if uploaded_file is not None:
         
         # Display comparison metrics
         st.info(f"📊 **සංසන්දන වාර්තාව (Comparison Summary):**\n"
-                f"- මුල් PDF ගොනුවේ තිබූ මුළු පේළි ගණන: **{total_input_lines}**\n"
+                f"- PDF එකේ තිබූ මුළු භාණ්ඩ පේළි ගණන: **{total_product_lines}**\n"
                 f"- සාර්ථකව ගැළපුණු භාණ්ඩ සංඛ්‍යාව: **{matched_count}**\n"
-                f"- මගහැරුණු / හඳුනා නොගත් අයිතම සංඛ්‍යාව: **{missing_count}**")
+                f"- මගහැරුණු / නාමාවලියේ නැති අයිතම සංඛ්‍යාව: **{missing_count}**")
         
         # Render Table Preview Natively
         st.subheader("දත්ත පෙරදසුන (Data Preview)")
