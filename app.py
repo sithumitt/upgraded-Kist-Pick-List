@@ -251,6 +251,14 @@ PRODUCT_MAPPING = {
     "vegetable flv noodles 85g": "වෙස්ටබල් නූඩ්ල්ස් 85",
     "prawn flv noodles 85g": "ප්‍රෝන් නූඩ්ල්ස් 85",
     "dry noodles 400g": "ඩ්‍රයි නූඩ්ල්ස් 400",
+
+    # ---- newly added items ----
+    "kot milky short cake bis 200gm": "මිල්ක් කේක් අලුත් බිස්කට්",
+    "magic chonkz 60gm": "චෝන්ස් පොඩි 60 ලා නිල්",
+    "s/berry flv melon jam 300g": "ස්ටෝබරි ජෑම් 300",
+    "orange nectar 200ml": "දොඩම් බීම 200",
+    # PDF prints 300g, but the Sinhala name must say 200
+    "oyster sauce squeeasy 300g": "ඔයිස්ටර් සෝස් ස්කීසි 200",
 }
 
 # Used only when no key in PRODUCT_MAPPING matched (e.g. "STRAWBERRY JAM 300G")
